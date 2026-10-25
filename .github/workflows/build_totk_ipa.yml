@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       base_gdrive_id:
-        description: 'Base Game (.xci) Google Drive Link veya ID'
+        description: 'Base Game (.xci veya .nsp) Google Drive Link veya ID'
         required: true
         type: string
       update_gdrive_id:
@@ -26,11 +26,12 @@ permissions:
 
 env:
   PIP_BREAK_SYSTEM_PACKAGES: "1"
+  HOMEBREW_NO_AUTO_UPDATE: "1"
 
 jobs:
   build-ipa:
     runs-on: macos-15
-    timeout-minutes: 240
+    timeout-minutes: 300
 
     steps:
       - name: 1. Disk Alanı Aç (Eski Xcode ve Gereksiz Araçları Sil - ~65 GB Kazanım)
@@ -49,93 +50,182 @@ jobs:
           sudo rm -rf /usr/local/lib/android || true
           sudo rm -rf /Library/Developer/CoreSimulator/Volumes || true
           sudo rm -rf /Users/runner/.dotnet || true
+          sudo rm -rf /usr/local/share/dotnet || true
           brew cleanup -s || true
           echo "=== Temizlik Sonrası Disk Durumu ==="
           df -h
 
-      - name: 2. nxnative Kaynak Kodunu İndir ve Bağımlılıkları Kur
+      - name: 2. nxnative Kaynak Kodunu İndir ve Tüm Bağımlılıkları Eksiksiz Kur
         run: |
           git clone https://github.com/seedds/nxnative.git
-          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen zstd spirv-cross glslang p7zip
-          if ! command -v dotnet >/dev/null 2>&1; then
-            HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask dotnet-sdk
+          
+          echo "=== Homebrew Paketleri Kuruluyor ==="
+          brew install xcodegen zstd spirv-cross glslang lz4 p7zip
+          
+          echo "=== .NET 10 SDK Kontrol Ediliyor / Kuruluyor ==="
+          if ! dotnet --list-sdks 2>/dev/null | grep -q "^10\."; then
+            brew install --cask dotnet-sdk || brew upgrade --cask dotnet-sdk
           fi
-          python3 -m pip install --break-system-packages gdown lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+          dotnet --info
+          
+          echo "=== Metal Derleyicisi Kontrol Ediliyor ==="
+          if ! xcrun -f metal >/dev/null 2>&1; then
+            echo "Metal Toolchain indiriliyor..."
+            xcodebuild -downloadComponent MetalToolchain || xcodebuild -downloadComponent metalToolchain || true
+          fi
+          xcrun -f metal || true
+          
+          echo "=== Python Paketleri ve C-Eklentili LZ4 Kuruluyor ==="
+          python3 -m pip install --break-system-packages gdown capstone fonttools "backports.zstd; python_version < '3.14'"
+          PYLZ4_USE_SYSTEM_LZ4=0 python3 -m pip install --break-system-packages --force-reinstall --no-binary lz4 lz4
+          python3 -c "import lz4.block, capstone, fontTools, gdown; print('Tüm Python modülleri sorunsuz yüklendi!')"
 
       - name: 3. Oyun Dosyalarını (.xci + .nsp) ve prod.keys Dosyasını Google Drive'dan İndir
+        env:
+          IN_KEYS: ${{ inputs.keys_gdrive_id }}
+          IN_BASE: ${{ inputs.base_gdrive_id }}
+          IN_UPD: ${{ inputs.update_gdrive_id }}
         run: |
           mkdir -p "$RUNNER_TEMP/Games/TotK"
           mkdir -p "$RUNNER_TEMP/keys"
           
-          echo "prod.keys indiriliyor..."
-          python3 -m gdown --fuzzy "${{ inputs.keys_gdrive_id }}" -O "$RUNNER_TEMP/keys/prod.keys"
+          python3 - << 'EOF'
+          import os, re, sys, zipfile
+          import gdown
+
+          def extract_id(val):
+              val = val.strip()
+              m = re.search(r'/d/([a-zA-Z0-9_-]{15,})', val)
+              if m:
+                  return m.group(1)
+              m = re.search(r'[?&]id=([a-zA-Z0-9_-]{15,})', val)
+              if m:
+                  return m.group(1)
+              return val
+
+          def smart_download(raw_input, out_path, min_bytes, label):
+              fid = extract_id(raw_input)
+              print(f"=== {label} indiriliyor (ID: {fid}) ===", flush=True)
+              try:
+                  res = gdown.download(id=fid, output=out_path, quiet=False, fuzzy=True)
+              except TypeError:
+                  url = f"https://drive.google.com/uc?id={fid}"
+                  res = gdown.download(url=url, output=out_path, quiet=False)
+              if not res or not os.path.exists(out_path):
+                  sys.exit(f"HATA: {label} indirilemedi! Lütfen Google Drive paylaşım izninin 'Bağlantıya sahip olan herkes' (Anyone with the link) olduğundan emin olun.")
+              sz = os.path.getsize(out_path)
+              print(f"{label} indirildi: {sz / (1024*1024):.2f} MB", flush=True)
+              if sz < min_bytes:
+                  with open(out_path, 'rb') as f:
+                      head = f.read(512)
+                  if b'<html' in head.lower() or b'<!doctype' in head.lower():
+                      sys.exit(f"HATA: {label} yerine Google Drive HTML uyarı sayfası indi! Dosya izinlerini veya indirme kotasını kontrol edin.")
+                  sys.exit(f"HATA: {label} boyutu beklenenden çok küçük ({sz} byte)!")
+
+          temp_dir = os.environ["RUNNER_TEMP"]
+          keys_out = os.path.join(temp_dir, "keys", "prod.keys")
+          smart_download(os.environ["IN_KEYS"], keys_out, 500, "prod.keys")
+
+          # Eğer prod.keys bir ZIP arşivi olarak yüklenmişse otomatik içinden çıkar
+          if zipfile.is_zipfile(keys_out):
+              print("Uyarı: prod.keys bir ZIP dosyası olarak algılandı, içinden çıkarılıyor...", flush=True)
+              with zipfile.ZipFile(keys_out, 'r') as z:
+                  extracted = False
+                  for name in z.namelist():
+                      if name.endswith(".keys") or "prod" in name.lower():
+                          data = z.read(name)
+                          with open(keys_out, "wb") as f:
+                              f.write(data)
+                          extracted = True
+                          print(f"ZIP içinden '{name}' başarıyla prod.keys olarak çıkarıldı!", flush=True)
+                          break
+                  if not extracted:
+                      sys.exit("HATA: prod.keys ZIP arşivinin içinde .keys dosyası bulunamadı!")
+
+          # Tears of the Kingdom profilindeki gerçek sürüm etiketini game.tsv'den oku
+          upd_ver = "v393216"
+          game_tsv = "nxnative/dm/games/0100F2C0115B6000/game.tsv"
+          if os.path.exists(game_tsv):
+              with open(game_tsv, "r", encoding="utf-8") as f:
+                  for line in f:
+                      m = re.search(r'\b(v[1-9][0-9]*)\b', line)
+                      if m:
+                          upd_ver = m.group(1)
+          print(f"Algılanan hedef Update sürüm etiketi: {upd_ver}", flush=True)
+          with open(os.path.join(temp_dir, "upd_ver.txt"), "w") as f:
+              f.write(upd_ver)
+
+          base_out = os.path.join(temp_dir, "Games", "TotK", "Tears of the Kingdom [0100F2C0115B6000][v0].xci")
+          upd_out = os.path.join(temp_dir, "Games", "TotK", f"Tears of the Kingdom [0100F2C0115B6800][{upd_ver}].nsp")
+
+          smart_download(os.environ["IN_BASE"], base_out, 100 * 1024 * 1024, "Base Game (.xci)")
+          smart_download(os.environ["IN_UPD"], upd_out, 10 * 1024 * 1024, "Update (.nsp)")
+          EOF
           
-          echo "Base Game (.xci) indiriliyor..."
-          python3 -m gdown --fuzzy "${{ inputs.base_gdrive_id }}" -O "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci"
-          
-          echo "Update (.nsp) indiriliyor..."
-          python3 -m gdown --fuzzy "${{ inputs.update_gdrive_id }}" -O "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp"
-          
-          ls -lh "$RUNNER_TEMP/Games/TotK"
+          ls -lh "$RUNNER_TEMP/Games/TotK" "$RUNNER_TEMP/keys/prod.keys"
           df -h
 
-      - name: 4. Dosyaları Çıkar ve Disk Dolmaması İçin Kaynak XCI/NSP'leri Hemen Sil
+      - name: 4. Dosyaları Çıkar, Kodları ve Shader'ları Derle, IPA Paketle (Akıllı Disk Temizlemeli)
         working-directory: nxnative
         run: |
+          set -e
           G=0100F2C0115B6000
-          W="$RUNNER_TEMP/work"
-          mkdir -p "$W"
-          
-          # Update NSP'nin gerçek sürüm etiketini otomatik algıla veya v393216 kullan
-          VER="v393216"
-          
-          echo "nx_extract derleniyor..."
-          dotnet build dm/tools/nx_extract -c Release -o "$W/build/nx_extract"
-          
-          echo "Base XCI çıkarılıyor (v0)..."
-          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" - "$W/data/v0"
-          
-          echo "Update NSP katmanlanarak çıkarılıyor ($VER)..."
-          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp" "$W/data/$VER" "$W/data/v0/RomFS"
-          
-          echo "Kaynak XCI ve NSP dosyaları silinerek ~18 GB disk alanı geri kazanılıyor..."
-          rm -rf "$RUNNER_TEMP/Games/TotK"
-          rm -rf "$RUNNER_TEMP/keys"
-          df -h
-
-      - name: 5. NSO Modüllerini Yeniden Yaz, Shader'ları Derle ve IPA Paketle
-        working-directory: nxnative
-        run: |
-          G=0100F2C0115B6000
-          W="$RUNNER_TEMP/work"
-          VER="v393216"
+          NSP_DIR="$RUNNER_TEMP/Games/TotK"
+          KEYS="$RUNNER_TEMP/keys/prod.keys"
+          OUT_IPA="$RUNNER_TEMP/out/TotK.ipa"
           mkdir -p "$RUNNER_TEMP/out"
           
-          echo "Modüller yeniden yazılıyor (patch_nso.py)..."
-          for m in $(python3 dm/games/game.py $G modules); do
-            python3 dm/tools/patch_nso.py "$W/data/$VER/ExeFS/$m" "$W/build/patched_$VER" "$m"
-          done
+          echo "=== Tears of the Kingdom Profil Bilgisi ==="
+          cat "dm/games/$G/game.tsv" || true
           
-          echo "Shader paketleri ayrıştırılıyor (shader_split.py)..."
-          DM_GAME=$G python3 dm/gfx/tools/shader_split.py "$W/data/v0/RomFS,$W/data/$VER/RomFS" "$W/data/v0/ExeFS/main,$W/data/$VER/ExeFS/main" "$W/shader/pkg" "dm/games/$G/shader_map.tsv" "dm/games/$G/shader_facts.tsv" "dm/games/$G/shader_pairs.tsv"
+          # Arka planda çalışan otomatik disk koruyucu:
+          # build_ipa_from_nsp.py ekstraksiyonu bitirip "patch_nso" (modül yeniden yazma) veya "shader" aşamasına geçtiği an,
+          # kaynak .xci ve .nsp dosyalarını otomatik silerek ~18 GB disk alanını anında serbest bırakır!
+          (
+            while true; do
+              if ls "$NSP_DIR/${G}_build"/patched_* >/dev/null 2>&1 || ls "$NSP_DIR/${G}_build"/shader/* >/dev/null 2>&1; then
+                echo "[Disk Koruyucu] Ekstraksiyon tamamlandı! Kaynak .xci ve .nsp dosyaları siliniyor (~18 GB yer açılıyor)..."
+                rm -f "$NSP_DIR"/*.xci "$NSP_DIR"/*.nsp
+                df -h
+                break
+              fi
+              sleep 5
+            done
+          ) &
+          WATCHER_PID=$!
           
-          echo "Mac ve iOS Metal shader kütüphaneleri derleniyor..."
-          DM_GAME=$G python3 dm/gfx/tools/own_compilers.py "$W/shader/pkg" "$W/build/cache/metal_shader_cache"
-          IOSOUT="$W/build/ios/dmsh_b" DM_GAME=$G python3 dm/gfx/tools/own_compilers.py "$W/shader/pkg" "$W/build/cache/metal_shader_cache"
+          # Ayrıca iOS shader derlemesi bittiğinde ve Xcode paketlemesine geçildiğinde v0 RomFS fazlalığını temizle
+          (
+            while true; do
+              if ls -d "$NSP_DIR/${G}_build"/ipa/build* >/dev/null 2>&1; then
+                echo "[Disk Koruyucu] Shader aşaması bitti, Xcode IPA paketlemesine geçildi! v0 RomFS siliniyor..."
+                rm -rf "$NSP_DIR/${G}_build/extract/v0" || true
+                df -h
+                break
+              fi
+              sleep 5
+            done
+          ) &
+          WATCHER2_PID=$!
           
-          echo "v0 RomFS temizleniyor..."
-          rm -rf "$W/data/v0"
+          echo "=== Resmi build_ipa_from_nsp.py Başlatılıyor ==="
+          python3 scripts/build_ipa_from_nsp.py "$NSP_DIR" \
+            -k "$KEYS" \
+            -o "$OUT_IPA" \
+            -l "${{ inputs.language }}" \
+            --show-fps \
+            --no-keep-extracted \
+            --allow-damaged \
+            --progress lines
           
-          echo "Nintendo uzantı fontu oluşturuluyor ve IPA paketleniyor..."
-          python3 dm/tools/make_ext_font.py "$W/build/font/nintendo_ext.ttf"
-          DM_LANG="${{ inputs.language }}" DM_SHOW_FPS=1 PATCHED="$W/build/patched_$VER" ROMFS="$W/data/$VER/RomFS" GAME=$G W="$W" dm/ios/tools/build_ipa.sh "$RUNNER_TEMP/out/TotK.ipa"
+          kill $WATCHER_PID $WATCHER2_PID 2>/dev/null || true
           
-          echo "IPA oluşturuldu, geçici çalışma klasörü siliniyor..."
-          rm -rf "$W"
-          ls -lh "$RUNNER_TEMP/out/TotK.ipa"
+          echo "=== Geçici Derleme Klasörleri Temizleniyor ==="
+          rm -rf "$NSP_DIR" "$RUNNER_TEMP/keys"
+          ls -lh "$OUT_IPA"
           df -h
 
-      - name: 6. IPA'yı 1.9 GB Parçalara Böl ve GitHub Releases'a Yükle
+      - name: 5. IPA'yı 1.9 GB Parçalara Böl ve GitHub Releases'a Yükle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
