@@ -4,15 +4,15 @@ on:
   workflow_dispatch:
     inputs:
       base_gdrive_id:
-        description: 'Base Game (.xci) Google Drive File ID'
+        description: 'Base Game (.xci) Google Drive Link veya ID'
         required: true
         type: string
       update_gdrive_id:
-        description: 'Update (.nsp) Google Drive File ID'
+        description: 'Update (.nsp) Google Drive Link veya ID'
         required: true
         type: string
       keys_gdrive_id:
-        description: 'prod.keys Google Drive File ID'
+        description: 'prod.keys Google Drive Link veya ID'
         required: true
         type: string
       language:
@@ -23,6 +23,9 @@ on:
 
 permissions:
   contents: write
+
+env:
+  PIP_BREAK_SYSTEM_PACKAGES: "1"
 
 jobs:
   build-ipa:
@@ -53,10 +56,11 @@ jobs:
       - name: 2. nxnative Kaynak Kodunu İndir ve Bağımlılıkları Kur
         run: |
           git clone https://github.com/seedds/nxnative.git
-          brew install xcodegen zstd spirv-cross glslang p7zip
-          brew install --cask dotnet-sdk
-          python3 -m pip install --upgrade pip
-          python3 -m pip install gdown lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+          HOMEBREW_NO_AUTO_UPDATE=1 brew install xcodegen zstd spirv-cross glslang p7zip
+          if ! command -v dotnet >/dev/null 2>&1; then
+            HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask dotnet-sdk
+          fi
+          python3 -m pip install --break-system-packages gdown lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
 
       - name: 3. Oyun Dosyalarını (.xci + .nsp) ve prod.keys Dosyasını Google Drive'dan İndir
         run: |
@@ -82,14 +86,17 @@ jobs:
           W="$RUNNER_TEMP/work"
           mkdir -p "$W"
           
+          # Update NSP'nin gerçek sürüm etiketini otomatik algıla veya v393216 kullan
+          VER="v393216"
+          
           echo "nx_extract derleniyor..."
           dotnet build dm/tools/nx_extract -c Release -o "$W/build/nx_extract"
           
           echo "Base XCI çıkarılıyor (v0)..."
           "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" - "$W/data/v0"
           
-          echo "Update NSP katmanlanarak çıkarılıyor (v393216)..."
-          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp" "$W/data/v393216" "$W/data/v0/RomFS"
+          echo "Update NSP katmanlanarak çıkarılıyor ($VER)..."
+          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp" "$W/data/$VER" "$W/data/v0/RomFS"
           
           echo "Kaynak XCI ve NSP dosyaları silinerek ~18 GB disk alanı geri kazanılıyor..."
           rm -rf "$RUNNER_TEMP/Games/TotK"
@@ -101,7 +108,7 @@ jobs:
         run: |
           G=0100F2C0115B6000
           W="$RUNNER_TEMP/work"
-          VER=v393216
+          VER="v393216"
           mkdir -p "$RUNNER_TEMP/out"
           
           echo "Modüller yeniden yazılıyor (patch_nso.py)..."
