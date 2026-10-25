@@ -1,0 +1,145 @@
+name: Build Zelda TotK IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_gdrive_id:
+        description: 'Base Game (.xci) Google Drive File ID'
+        required: true
+        type: string
+      update_gdrive_id:
+        description: 'Update (.nsp) Google Drive File ID'
+        required: true
+        type: string
+      keys_gdrive_id:
+        description: 'prod.keys Google Drive File ID'
+        required: true
+        type: string
+      language:
+        description: 'Game Language (e.g. en-US, ja, fr, de, es)'
+        required: false
+        default: 'en-US'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-ipa:
+    runs-on: macos-15
+    timeout-minutes: 240
+
+    steps:
+      - name: 1. Disk Alanı Aç (Eski Xcode ve Gereksiz Araçları Sil - ~65 GB Kazanım)
+        run: |
+          echo "=== Temizlik Öncesi Disk Durumu ==="
+          df -h
+          ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer||')
+          echo "Aktif Xcode korunuyor: $ACTIVE_XCODE"
+          for x in /Applications/Xcode*.app; do
+            if [ "$x" != "$ACTIVE_XCODE" ]; then
+              echo "Siliniyor: $x"
+              sudo rm -rf "$x" || true
+            fi
+          done
+          sudo rm -rf /Users/runner/Library/Android || true
+          sudo rm -rf /usr/local/lib/android || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes || true
+          sudo rm -rf /Users/runner/.dotnet || true
+          brew cleanup -s || true
+          echo "=== Temizlik Sonrası Disk Durumu ==="
+          df -h
+
+      - name: 2. nxnative Kaynak Kodunu İndir ve Bağımlılıkları Kur
+        run: |
+          git clone https://github.com/seedds/nxnative.git
+          brew install xcodegen zstd spirv-cross glslang p7zip
+          brew install --cask dotnet-sdk
+          python3 -m pip install --upgrade pip
+          python3 -m pip install gdown lz4 capstone fonttools "backports.zstd; python_version < '3.14'"
+
+      - name: 3. Oyun Dosyalarını (.xci + .nsp) ve prod.keys Dosyasını Google Drive'dan İndir
+        run: |
+          mkdir -p "$RUNNER_TEMP/Games/TotK"
+          mkdir -p "$RUNNER_TEMP/keys"
+          
+          echo "prod.keys indiriliyor..."
+          python3 -m gdown --fuzzy "${{ inputs.keys_gdrive_id }}" -O "$RUNNER_TEMP/keys/prod.keys"
+          
+          echo "Base Game (.xci) indiriliyor..."
+          python3 -m gdown --fuzzy "${{ inputs.base_gdrive_id }}" -O "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci"
+          
+          echo "Update (.nsp) indiriliyor..."
+          python3 -m gdown --fuzzy "${{ inputs.update_gdrive_id }}" -O "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp"
+          
+          ls -lh "$RUNNER_TEMP/Games/TotK"
+          df -h
+
+      - name: 4. Dosyaları Çıkar ve Disk Dolmaması İçin Kaynak XCI/NSP'leri Hemen Sil
+        working-directory: nxnative
+        run: |
+          G=0100F2C0115B6000
+          W="$RUNNER_TEMP/work"
+          mkdir -p "$W"
+          
+          echo "nx_extract derleniyor..."
+          dotnet build dm/tools/nx_extract -c Release -o "$W/build/nx_extract"
+          
+          echo "Base XCI çıkarılıyor (v0)..."
+          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" - "$W/data/v0"
+          
+          echo "Update NSP katmanlanarak çıkarılıyor (v393216)..."
+          "$W/build/nx_extract/nx_extract" "$RUNNER_TEMP/keys/prod.keys" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6000][v0].xci" "$RUNNER_TEMP/Games/TotK/Tears of the Kingdom [0100F2C0115B6800][v393216].nsp" "$W/data/v393216" "$W/data/v0/RomFS"
+          
+          echo "Kaynak XCI ve NSP dosyaları silinerek ~18 GB disk alanı geri kazanılıyor..."
+          rm -rf "$RUNNER_TEMP/Games/TotK"
+          rm -rf "$RUNNER_TEMP/keys"
+          df -h
+
+      - name: 5. NSO Modüllerini Yeniden Yaz, Shader'ları Derle ve IPA Paketle
+        working-directory: nxnative
+        run: |
+          G=0100F2C0115B6000
+          W="$RUNNER_TEMP/work"
+          VER=v393216
+          mkdir -p "$RUNNER_TEMP/out"
+          
+          echo "Modüller yeniden yazılıyor (patch_nso.py)..."
+          for m in $(python3 dm/games/game.py $G modules); do
+            python3 dm/tools/patch_nso.py "$W/data/$VER/ExeFS/$m" "$W/build/patched_$VER" "$m"
+          done
+          
+          echo "Shader paketleri ayrıştırılıyor (shader_split.py)..."
+          DM_GAME=$G python3 dm/gfx/tools/shader_split.py "$W/data/v0/RomFS,$W/data/$VER/RomFS" "$W/data/v0/ExeFS/main,$W/data/$VER/ExeFS/main" "$W/shader/pkg" "dm/games/$G/shader_map.tsv" "dm/games/$G/shader_facts.tsv" "dm/games/$G/shader_pairs.tsv"
+          
+          echo "Mac ve iOS Metal shader kütüphaneleri derleniyor..."
+          DM_GAME=$G python3 dm/gfx/tools/own_compilers.py "$W/shader/pkg" "$W/build/cache/metal_shader_cache"
+          IOSOUT="$W/build/ios/dmsh_b" DM_GAME=$G python3 dm/gfx/tools/own_compilers.py "$W/shader/pkg" "$W/build/cache/metal_shader_cache"
+          
+          echo "v0 RomFS temizleniyor..."
+          rm -rf "$W/data/v0"
+          
+          echo "Nintendo uzantı fontu oluşturuluyor ve IPA paketleniyor..."
+          python3 dm/tools/make_ext_font.py "$W/build/font/nintendo_ext.ttf"
+          DM_LANG="${{ inputs.language }}" DM_SHOW_FPS=1 PATCHED="$W/build/patched_$VER" ROMFS="$W/data/$VER/RomFS" GAME=$G W="$W" dm/ios/tools/build_ipa.sh "$RUNNER_TEMP/out/TotK.ipa"
+          
+          echo "IPA oluşturuldu, geçici çalışma klasörü siliniyor..."
+          rm -rf "$W"
+          ls -lh "$RUNNER_TEMP/out/TotK.ipa"
+          df -h
+
+      - name: 6. IPA'yı 1.9 GB Parçalara Böl ve GitHub Releases'a Yükle
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd "$RUNNER_TEMP/out"
+          echo "GitHub 2 GB Release limitine takılmamak için 1900 MB parçalara bölünüyor (sıkıştırmasız hızlı bölme)..."
+          7z a -v1900m -mx0 TotK_IPA.7z TotK.ipa
+          rm -f TotK.ipa
+          ls -lh
+          
+          TAG="build-${{ github.run_number }}"
+          gh release create "$TAG" TotK_IPA.7z.* \
+            --repo "${{ github.repository }}" \
+            --title "Tears of the Kingdom IPA (#${{ github.run_number }})" \
+            --notes "İndirdikten sonra tüm parçaları (TotK_IPA.7z.001, .002...) aynı klasöre koyup 7-Zip ile 001 dosyasına sağ tıklayarak çıkartın ve hemen ardından bu Release'i silin."
