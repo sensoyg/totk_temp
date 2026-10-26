@@ -30,19 +30,28 @@ env:
 
 jobs:
   build-ipa:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 300
 
     steps:
-      - name: 1. Disk Alanı Aç (Eski Xcode ve Gereksiz Araçları Sil - ~65 GB Kazanım)
+      - name: 1. En Yeni Xcode (Xcode 26+) Seç ve Disk Alanı Aç (~75 GB Boş Alan)
         run: |
-          echo "=== Temizlik Öncesi Disk Durumu ==="
-          df -h
-          ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer||')
-          echo "Aktif Xcode korunuyor: $ACTIVE_XCODE"
+          echo "=== Mevcut Xcode Sürümleri ==="
+          ls -d /Applications/Xcode*.app || true
+          
+          # En yüksek sürümlü Xcode'u (Xcode 26+) otomatik seç
+          LATEST_XCODE=$(ls -d /Applications/Xcode*.app | grep -v "beta" | sort -V | tail -n 1)
+          if [ -z "$LATEST_XCODE" ]; then
+            LATEST_XCODE=$(ls -d /Applications/Xcode*.app | sort -V | tail -n 1)
+          fi
+          echo "En güncel Xcode aktif ediliyor: $LATEST_XCODE"
+          sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          xcodebuild -version
+          
+          # Diğer tüm eski Xcode sürümlerini silerek ~65-75 GB yer aç
           for x in /Applications/Xcode*.app; do
-            if [ "$x" != "$ACTIVE_XCODE" ]; then
-              echo "Siliniyor: $x"
+            if [ "$x" != "$LATEST_XCODE" ]; then
+              echo "Eski Xcode siliniyor: $x"
               sudo rm -rf "$x" || true
             fi
           done
@@ -52,35 +61,52 @@ jobs:
           sudo rm -rf /Users/runner/.dotnet || true
           sudo rm -rf /usr/local/share/dotnet || true
           brew cleanup -s || true
-          echo "=== Temizlik Sonrası Disk Durumu ==="
           df -h
 
-      - name: 2. nxnative Kaynak Kodunu İndir ve Tüm Bağımlılıkları Eksiksiz Kur
+      - name: 2. nxnative Kaynak Kodunu İndir ve Bağımlılıkları Kur
         run: |
           git clone https://github.com/seedds/nxnative.git
           
-          echo "=== Homebrew Paketleri Kuruluyor ==="
           brew install xcodegen zstd spirv-cross glslang lz4 p7zip
           
-          echo "=== .NET 10 SDK Kontrol Ediliyor / Kuruluyor ==="
           if ! dotnet --list-sdks 2>/dev/null | grep -q "^10\."; then
             brew install --cask dotnet-sdk || brew upgrade --cask dotnet-sdk
           fi
-          dotnet --info
           
-          echo "=== Metal Derleyicisi Kontrol Ediliyor ==="
           if ! xcrun -f metal >/dev/null 2>&1; then
-            echo "Metal Toolchain indiriliyor..."
             xcodebuild -downloadComponent MetalToolchain || xcodebuild -downloadComponent metalToolchain || true
           fi
-          xcrun -f metal || true
           
-          echo "=== Python Paketleri ve C-Eklentili LZ4 Kuruluyor ==="
           python3 -m pip install --break-system-packages gdown capstone fonttools "backports.zstd; python_version < '3.14'"
           PYLZ4_USE_SYSTEM_LZ4=0 python3 -m pip install --break-system-packages --force-reinstall --no-binary lz4 lz4
-          python3 -c "import lz4.block, capstone, fontTools, gdown; print('Tüm Python modülleri sorunsuz yüklendi!')"
+          
+          # GÜVENLİK ÖNLEMİ: Eğer Xcode sürümü glassProminent stilini tanımazsa diye Launcher.swift uyumluluk yaması
+          if ! xcodebuild -version | grep -E "Xcode (2[6-9]|[3-9][0-9])" >/dev/null 2>&1; then
+            echo "Eski Xcode SDK algılandı, Launcher.swift glassProminent -> borderedProminent uyumluluk yaması uygulanıyor..."
+            sed -i '' 's/\.glassProminent/.borderedProminent/g' nxnative/dm/ios/Sources/Launcher.swift || true
+            sed -i '' 's/\.glass/.bordered/g' nxnative/dm/ios/Sources/Launcher.swift || true
+          fi
+          
+          echo "=== iOS Xcode Derlemesi ÖN TESTİ (Oyun İndirilmeden Önce 15 Saniyede Kontrol) ==="
+          GAME=010015100B514000 python3 nxnative/dm/ios/tools/build_smoke.py --output "$RUNNER_TEMP/ios-smoke"
+          rm -rf "$RUNNER_TEMP/ios-smoke"
+          echo "✓ iOS Xcode derleme ön testi BAŞARILI! Artık güvenle derlemeye geçilebilir."
 
-      - name: 3. Oyun Dosyalarını (.xci + .nsp) ve prod.keys Dosyasını Google Drive'dan İndir
+      - name: 3. Önbellek (Cache) Kontrolü — Varsa Önceki Shader ve Modülleri Geri Yükle
+        id: build-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/patched_*
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/shader
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/font
+            nxnative/dm/games/0100F2C0115B6000/c1_full.tsv
+            nxnative/dm/games/0100F2C0115B6000/cb_extent.tsv
+          key: totk-shaders-v1-${{ inputs.base_gdrive_id }}-${{ inputs.update_gdrive_id }}
+          restore-keys: |
+            totk-shaders-v1-
+
+      - name: 4. Oyun Dosyalarını (.xci + .nsp) ve prod.keys Dosyasını Google Drive'dan İndir
         env:
           IN_KEYS: ${{ inputs.keys_gdrive_id }}
           IN_BASE: ${{ inputs.base_gdrive_id }}
@@ -112,38 +138,25 @@ jobs:
                   url = f"https://drive.google.com/uc?id={fid}"
                   res = gdown.download(url=url, output=out_path, quiet=False)
               if not res or not os.path.exists(out_path):
-                  sys.exit(f"HATA: {label} indirilemedi! Lütfen Google Drive paylaşım izninin 'Bağlantıya sahip olan herkes' (Anyone with the link) olduğundan emin olun.")
+                  sys.exit(f"HATA: {label} indirilemedi! Lütfen Google Drive paylaşım izninin 'Bağlantıya sahip olan herkes' olduğundan emin olun.")
               sz = os.path.getsize(out_path)
               print(f"{label} indirildi: {sz / (1024*1024):.2f} MB", flush=True)
               if sz < min_bytes:
-                  with open(out_path, 'rb') as f:
-                      head = f.read(512)
-                  if b'<html' in head.lower() or b'<!doctype' in head.lower():
-                      sys.exit(f"HATA: {label} yerine Google Drive HTML uyarı sayfası indi! Dosya izinlerini veya indirme kotasını kontrol edin.")
-                  sys.exit(f"HATA: {label} boyutu beklenenden çok küçük ({sz} byte)!")
+                  sys.exit(f"HATA: {label} boyutu beklenenden çok küçük ({sz} byte)! Google Drive günlük indirme kotası dolmuş olabilir.")
 
           temp_dir = os.environ["RUNNER_TEMP"]
           keys_out = os.path.join(temp_dir, "keys", "prod.keys")
           smart_download(os.environ["IN_KEYS"], keys_out, 500, "prod.keys")
 
-          # Eğer prod.keys bir ZIP arşivi olarak yüklenmişse otomatik içinden çıkar
           if zipfile.is_zipfile(keys_out):
-              print("Uyarı: prod.keys bir ZIP dosyası olarak algılandı, içinden çıkarılıyor...", flush=True)
               with zipfile.ZipFile(keys_out, 'r') as z:
-                  extracted = False
                   for name in z.namelist():
                       if name.endswith(".keys") or "prod" in name.lower():
-                          data = z.read(name)
                           with open(keys_out, "wb") as f:
-                              f.write(data)
-                          extracted = True
-                          print(f"ZIP içinden '{name}' başarıyla prod.keys olarak çıkarıldı!", flush=True)
+                              f.write(z.read(name))
                           break
-                  if not extracted:
-                      sys.exit("HATA: prod.keys ZIP arşivinin içinde .keys dosyası bulunamadı!")
 
-          # Tears of the Kingdom profilindeki gerçek sürüm etiketini game.tsv'den oku
-          upd_ver = "v393216"
+          upd_ver = "v720896"
           game_tsv = "nxnative/dm/games/0100F2C0115B6000/game.tsv"
           if os.path.exists(game_tsv):
               with open(game_tsv, "r", encoding="utf-8") as f:
@@ -152,8 +165,6 @@ jobs:
                       if m:
                           upd_ver = m.group(1)
           print(f"Algılanan hedef Update sürüm etiketi: {upd_ver}", flush=True)
-          with open(os.path.join(temp_dir, "upd_ver.txt"), "w") as f:
-              f.write(upd_ver)
 
           base_out = os.path.join(temp_dir, "Games", "TotK", "Tears of the Kingdom [0100F2C0115B6000][v0].xci")
           upd_out = os.path.join(temp_dir, "Games", "TotK", f"Tears of the Kingdom [0100F2C0115B6800][{upd_ver}].nsp")
@@ -161,11 +172,9 @@ jobs:
           smart_download(os.environ["IN_BASE"], base_out, 100 * 1024 * 1024, "Base Game (.xci)")
           smart_download(os.environ["IN_UPD"], upd_out, 10 * 1024 * 1024, "Update (.nsp)")
           EOF
-          
-          ls -lh "$RUNNER_TEMP/Games/TotK" "$RUNNER_TEMP/keys/prod.keys"
-          df -h
 
-      - name: 4. Dosyaları Çıkar, Kodları ve Shader'ları Derle, IPA Paketle (Akıllı Disk Temizlemeli)
+      - name: 5. Derlemeyi Çalıştır (ve Shader Çıktılarını Önbelleğe Hazırla)
+        id: build-step
         working-directory: nxnative
         run: |
           set -e
@@ -175,18 +184,12 @@ jobs:
           OUT_IPA="$RUNNER_TEMP/out/TotK.ipa"
           mkdir -p "$RUNNER_TEMP/out"
           
-          echo "=== Tears of the Kingdom Profil Bilgisi ==="
-          cat "dm/games/$G/game.tsv" || true
-          
-          # Arka planda çalışan otomatik disk koruyucu:
-          # build_ipa_from_nsp.py ekstraksiyonu bitirip "patch_nso" (modül yeniden yazma) veya "shader" aşamasına geçtiği an,
-          # kaynak .xci ve .nsp dosyalarını otomatik silerek ~18 GB disk alanını anında serbest bırakır!
+          # Arka plan disk koruyucusu: ekstraksiyon biter bitmez .xci ve .nsp dosyalarını siler (~18 GB kazanç)
           (
             while true; do
               if ls "$NSP_DIR/${G}_build"/patched_* >/dev/null 2>&1 || ls "$NSP_DIR/${G}_build"/shader/* >/dev/null 2>&1; then
-                echo "[Disk Koruyucu] Ekstraksiyon tamamlandı! Kaynak .xci ve .nsp dosyaları siliniyor (~18 GB yer açılıyor)..."
+                echo "[Disk Koruyucu] Ekstraksiyon tamamlandı! Kaynak .xci ve .nsp dosyaları siliniyor..."
                 rm -f "$NSP_DIR"/*.xci "$NSP_DIR"/*.nsp
-                df -h
                 break
               fi
               sleep 5
@@ -194,13 +197,13 @@ jobs:
           ) &
           WATCHER_PID=$!
           
-          # Ayrıca iOS shader derlemesi bittiğinde ve Xcode paketlemesine geçildiğinde v0 RomFS fazlalığını temizle
+          # Xcode paketlemesine geçildiğinde v0 RomFS fazlalığını ve cas önbelleğini temizle
           (
             while true; do
               if ls -d "$NSP_DIR/${G}_build"/ipa/build* >/dev/null 2>&1; then
                 echo "[Disk Koruyucu] Shader aşaması bitti, Xcode IPA paketlemesine geçildi! v0 RomFS siliniyor..."
                 rm -rf "$NSP_DIR/${G}_build/extract/v0" || true
-                df -h
+                rm -rf "$NSP_DIR/${G}_build/shader/cache/cas" || true
                 break
               fi
               sleep 5
@@ -208,7 +211,6 @@ jobs:
           ) &
           WATCHER2_PID=$!
           
-          echo "=== Resmi build_ipa_from_nsp.py Başlatılıyor ==="
           python3 scripts/build_ipa_from_nsp.py "$NSP_DIR" \
             -k "$KEYS" \
             -o "$OUT_IPA" \
@@ -219,16 +221,25 @@ jobs:
             --progress lines
           
           kill $WATCHER_PID $WATCHER2_PID 2>/dev/null || true
-          
-          echo "=== Geçici Derleme Klasörleri Temizleniyor ==="
-          rm -rf "$NSP_DIR" "$RUNNER_TEMP/keys"
           ls -lh "$OUT_IPA"
-          df -h
 
-      - name: 5. IPA'yı 1.9 GB Parçalara Böl ve GitHub Releases'a Yükle
+      - name: 6. Derlenen Shader ve Modülleri Önbelleğe (Cache) Kaydet (Hata Olsa Bile Kaydeder!)
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/patched_*
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/shader
+            /Users/runner/work/_temp/Games/TotK/0100F2C0115B6000_build/font
+            nxnative/dm/games/0100F2C0115B6000/c1_full.tsv
+            nxnative/dm/games/0100F2C0115B6000/cb_extent.tsv
+          key: totk-shaders-v1-${{ inputs.base_gdrive_id }}-${{ inputs.update_gdrive_id }}-${{ github.run_id }}
+
+      - name: 7. IPA'yı 1.9 GB Parçalara Böl ve GitHub Releases'a Yükle
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          rm -rf "$RUNNER_TEMP/Games/TotK" "$RUNNER_TEMP/keys"
           cd "$RUNNER_TEMP/out"
           echo "GitHub 2 GB Release limitine takılmamak için 1900 MB parçalara bölünüyor (sıkıştırmasız hızlı bölme)..."
           7z a -v1900m -mx0 TotK_IPA.7z TotK.ipa
