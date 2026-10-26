@@ -40,23 +40,27 @@ jobs:
           ls -d /Applications/Xcode*.app || true
           
           # nxnative iOS 26 Metal 4 ve apple-a18 mimarisi için Xcode 26+ sürümünü seç
-          TARGET_XCODE=$(ls -d /Applications/Xcode_2[6-9]*.app /Applications/Xcode_[3-9]*.app 2>/dev/null | grep -v -i "beta" | sort -V | tail -n 1)
-          if [ -z "$TARGET_XCODE" ]; then
-            TARGET_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i "beta" | sort -V | tail -n 1)
+          RAW_XCODE=$(ls -d /Applications/Xcode_2[6-9]*.app /Applications/Xcode_[3-9]*.app 2>/dev/null | grep -v -i "beta" | sort -V | tail -n 1)
+          if [ -z "$RAW_XCODE" ]; then
+            RAW_XCODE=$(ls -d /Applications/Xcode_*.app 2>/dev/null | grep -v -i "beta" | sort -V | tail -n 1)
           fi
-          if [ -z "$TARGET_XCODE" ]; then
-            TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
+          if [ -z "$RAW_XCODE" ]; then
+            RAW_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1)
           fi
           
-          echo "Seçilen ve Korunan Tam Xcode: $TARGET_XCODE"
+          # Symlink ise asıl hedef dizini bul (örneğin Xcode_26.3.0.app -> Xcode_26.3.app)
+          TARGET_XCODE=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$RAW_XCODE")
+          
+          echo "Seçilen ve Korunan Tam Xcode: $TARGET_XCODE (Kaynak: $RAW_XCODE)"
           sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
           export DEVELOPER_DIR="$TARGET_XCODE/Contents/Developer"
           echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
           xcodebuild -version
           
-          # Diğer tüm Xcode sürümlerini silerek ~74 GB yer aç
+          # Diğer tüm Xcode sürümlerini silerek ~74 GB yer aç (asıl Xcode veya ona işaret eden linkler korunur)
           for x in /Applications/Xcode*.app; do
-            if [ "$x" != "$TARGET_XCODE" ]; then
+            REAL_X=$(python3 -c "import os, sys; print(os.path.realpath(sys.argv[1]))" "$x" 2>/dev/null || echo "$x")
+            if [ "$REAL_X" != "$TARGET_XCODE" ] && [ "$x" != "$TARGET_XCODE" ]; then
               echo "Eski Xcode siliniyor: $x"
               sudo rm -rf "$x" || true
             fi
